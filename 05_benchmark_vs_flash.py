@@ -1,0 +1,163 @@
+import warnings
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="google.genai")
+
+import json
+import statistics
+import time
+from typing import Literal
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+
+load_dotenv()
+
+# Standard client for generative models, v1beta client for Decisions API
+gen_client = genai.Client()
+dec_client = genai.Client(http_options=types.HttpOptions(api_version="v1beta"))
+
+TEST_CASES = [
+    {
+        "order": {"id": "8821", "item": "headphones", "price_usd": 240, "tier": "Gold"},
+        "message": "Audio cuts out on the left earcup. Fix it today or I cancel my membership.",
+    },
+    {
+        "order": {"id": "9012", "item": "coffee_maker", "price_usd": 85, "tier": "Standard"},
+        "message": "I was charged twice for this order on my statement. Please refund one charge.",
+    },
+    {
+        "order": {"id": "9450", "item": "standing_desk", "price_usd": 520, "tier": "Platinum"},
+        "message": "Tracking hasn't updated in 5 days—is it stuck at the warehouse?",
+    },
+]
+
+
+# Pydantic schema required by Gemini 2.5 Flash Structured Outputs
+class TicketTriageSchema(BaseModel):
+    is_refund: bool = Field(description="Whether the customer is requesting a refund or duplicate charge reversal.")
+    department: Literal["billing", "technical", "shipping", "other"]
+    urgency_score: int = Field(ge=0, le=3, description="0=Low, 1=Medium, 2=High, 3=Critical")
+    self_reported_confidence: float = Field(ge=0.0, le=1.0, description="Estimated confidence from 0 to 1.")
+
+
+def run_decisions_api(case: dict) -> dict:
+    payload = [
+        {"type": "text", "text": json.dumps(case["order"]) + "\n"},
+        {"type": "text", "text": json.dumps({"message": case["message"]})},
+    ]
+
+    t0 = time.perf_counter()
+    res = dec_client.decisions.create(
+        model="gemini-decision-1",
+        input=payload,
+        questions={
+            "is_refund": {
+                "type": "noul",
+                "instructions": "Is the customer requesting a refund or duplicate charge reversal?",
+            },
+            "department": {
+                "type": "choice",
+                "instructions": "Which department should handle this support ticket?",
+                "criteria": {
+                    "billing": "Double charges, invoices, payment methods, and refunds.",
+                    "technical": "Hardware defects, software bugs, or product setup issues.",
+                    "shipping": "Missing packages, tracking updates, and delivery delays.",
+                    "other": "General inquiries outside billing, technical, or shipping.",
+                },
+            },
+            "urgency": {
+                "type": "score",
+                "instructions": "How urgent is this ticket based on financial impact and churn risk?",
+                "criteria": [
+                    "Low: General question with no immediate impact.",
+                    "Medium: Standard issue, customer is calm.",
+                    "High: Active billing error or broken product.",
+                    "Critical: Severe outage or explicit threat to cancel subscription.",
+                ],
+            },
+        },
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    a = res.answers
+    return {
+        "latency_ms": elapsed_ms,
+        "input_tokens": res.usage.total_input_tokens,
+        "output_tokens": res.usage.total_output_tokens,
+        "department": a["department"].choice,
+        "confidence": a["department"].confidence,
+    }
+
+
+def run_flash_structured(case: dict) -> dict:
+    prompt = (
+        "Classify this support ticket into JSON matching the schema.\n"
+        f"Order: {json.dumps(case['order'])}\n"
+        f"Message: {case['message']}"
+    )
+
+    t0 = time.perf_counter()
+    res = gen_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=TicketTriageSchema,
+            temperature=0.0,
+        ),
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    parsed = json.loads(res.text)
+
+    return {
+        "latency_ms": elapsed_ms,
+        "input_tokens": res.usage_metadata.prompt_token_count,
+        "output_tokens": res.usage_metadata.candidates_token_count,
+        "department": parsed["department"],
+        "confidence": parsed["self_reported_confidence"],
+    }
+
+
+def main():
+    # Warm-up call so TLS/connection pooling doesn't skew the first run
+    _ = run_decisions_api(TEST_CASES[0])
+    _ = run_flash_structured(TEST_CASES[0])
+
+    dec_runs, flash_runs = [], []
+
+    print("Running side-by-side benchmark across 3 support tickets...\n")
+    for idx, case in enumerate(TEST_CASES, start=1):
+        d = run_decisions_api(case)
+        f = run_flash_structured(case)
+        dec_runs.append(d)
+        flash_runs.append(f)
+
+        print(f"Case #{idx}: {case['message'][:52]}...")
+        print(
+            f"  [Decisions API] {d['latency_ms']:6.1f} ms | "
+            f"In: {d['input_tokens']:3d} tok | Out: {d['output_tokens']:2d} tok | "
+            f"Dept: {d['department']:9s} (Calibrated Conf: {d['confidence']:.2f})"
+        )
+        print(
+            f"  [2.5 Flash    ] {f['latency_ms']:6.1f} ms | "
+            f"In: {f['input_tokens']:3d} tok | Out: {f['output_tokens']:2d} tok | "
+            f"Dept: {f['department']:9s} (Verbalized Conf: {f['confidence']:.2f})\n"
+        )
+
+    avg_dec_ms = statistics.mean(r["latency_ms"] for r in dec_runs)
+    avg_flash_ms = statistics.mean(r["latency_ms"] for r in flash_runs)
+    avg_dec_out = statistics.mean(r["output_tokens"] for r in dec_runs)
+    avg_flash_out = statistics.mean(r["output_tokens"] for r in flash_runs)
+
+    print("=" * 74)
+    print(f"{'Metric':<28} | {'gemini-decision-1':<20} | {'gemini-2.5-flash':<20}")
+    print("-" * 74)
+    print(f"{'Avg Latency (ms)':<28} | {avg_dec_ms:<20.1f} | {avg_flash_ms:<20.1f}")
+    print(f"{'Avg Output Tokens':<28} | {avg_dec_out:<20.1f} | {avg_flash_out:<20.1f}")
+    print(f"{'JSON Parsing Required?':<28} | {'No (Native Typed)':<20} | {'Yes (json.loads)':<20}")
+    print(f"{'Probability Calibration':<28} | {'Mathematically Calib.':<20} | {'Unreliable Self-Report':<20}")
+    print("=" * 74)
+
+
+if __name__ == "__main__":
+    main()
